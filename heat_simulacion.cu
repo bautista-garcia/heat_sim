@@ -4,9 +4,10 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include "cuda_utils.h"
+#define TILE_X 32
 
 // 2 grids para evitar conflictos de memoria en DEVICE y una en HOST para resultado final
-float *d_grid, *d_grid_new, *h_grid; 
+float *d_grid, *d_grid_new, *h_grid, *tmp; 
 float diffusion_rate = 0.25f;
 int grid_size = 0;
 
@@ -30,7 +31,7 @@ __global__ void mantener_fuentes_de_calor(float* _grid, int grid_size){
 
     _grid[cy * grid_size + cx] = 100.0f;
 
-    int offset = 4;
+    int offset = 8;
 
     if (cy + offset < grid_size && cx + offset < grid_size) {
         _grid[(cy + offset) * grid_size + (cx + offset)] = 100.0f;
@@ -46,27 +47,33 @@ __global__ void mantener_fuentes_de_calor(float* _grid, int grid_size){
     }
 }
 
-__global__ void actualizar_simulacion(float* _grid, float* _grid_new, int grid_size, float diffusion_rate){
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= grid_size || y >= grid_size) {
-        return;
+__global__ void actualizar_simulacion(float* _grid, float* _grid_new, int N, float k){
+    int x  = blockIdx.x * blockDim.x + threadIdx.x;
+    int y  = blockIdx.y * blockDim.y + threadIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    // ---- Dynamic shared memory with +1 padding in X ----
+    extern __shared__ float smem[];
+    const int pitch = blockDim.x + 1;                    // +1 padding in X
+    float* tile = smem;                                  // [blockDim.y][blockDim.x+1] linearized
+
+    if (x >= N || y >= N) return;
+
+    // Etapa 1: Acceso coalescente + memoria compartida
+    tile[ty * pitch + tx] = _grid[y * N + x];
+    __syncthreads();
+
+    // Etapa 2: Calculo de la temperatura (interior del bloque y del dominio)
+    if (x > 0 && x < N-1 && y > 0 && y < N-1 &&
+        tx > 0 && tx < blockDim.x-1 && ty > 0 && ty < blockDim.y-1) {
+
+        float c = tile[ty * pitch + tx];
+        float u = tile[(ty-1) * pitch + tx];
+        float d = tile[(ty+1) * pitch + tx];
+        float l = tile[ty * pitch + (tx-1)];
+        float r = tile[ty * pitch + (tx+1)];
+        _grid_new[y*N + x] = c + k*(u+d+l+r - 4.0f*c);
     }
-
-    int idx = y * grid_size + x;
-
-    if (y > 0 && y < grid_size - 1 && x > 0 && x < grid_size - 1) {
-        _grid_new[idx] = _grid[idx] + diffusion_rate * (_grid[idx - 1] + _grid[idx + 1] + _grid[idx - grid_size] + _grid[idx + grid_size] - 4 * _grid[idx]);
-    }
-
-    _grid[idx] = _grid_new[idx];
-}
-
-void update_simulation(float* _grid, float* _grid_new, int grid_size, float diffusion_rate, int threads_per_block, dim3 grid_dim, dim3 block_dim){
-    actualizar_simulacion<<<grid_dim, block_dim>>>(_grid, _grid_new, grid_size, diffusion_rate);
-    cudaDeviceSynchronize();
-    mantener_fuentes_de_calor<<<1, 1>>>(_grid, grid_size);
-    cudaDeviceSynchronize();
 }
 
 double dwalltime(){
@@ -77,10 +84,6 @@ double dwalltime(){
     sec = tv.tv_sec + tv.tv_usec/1000000.0;
     return sec;
 }
-
-
-
-
 
 int main(int argc, char** argv){
     if (argc < 5) {
@@ -93,6 +96,7 @@ int main(int argc, char** argv){
     cudaGetDeviceProperties(&prop, 0);
     PRINT_DEVICE_NAME(prop);
     PRINT_DEVICE_PROP(prop);
+
     // Parametrizacion de la simulacion
     int N = atoi(argv[1]);
     int threads_per_block = atoi(argv[2]);
@@ -103,18 +107,31 @@ int main(int argc, char** argv){
         return 1;
     }
     const char* output_path = (argc >= 6) ? argv[5] : "simulation_output.txt";
-    // double ti_transferencia, tf_transferencia;
-    // double ti_total, tf_total;
-    // double ti_kernel, tf_kernel;
-    //Declaración de variables de CPU y GPU
+
+    // Declaración de variables de CPU y GPU
     initialize_grid(N);
-    dim3 block_dim(sqrt(threads_per_block), sqrt(threads_per_block));
+
+    // Block/grid config (mantengo tu lógica de Y a partir de tpb)
+    dim3 block_dim(TILE_X, CEIL_DIV(threads_per_block, TILE_X));
     dim3 grid_dim(CEIL_DIV(N, block_dim.x), CEIL_DIV(N, block_dim.y));
+
+    // ---- Shared memory size (padding-only): by * (bx+1) floats ----
+    size_t shm_bytes = (size_t)block_dim.y * (block_dim.x + 1) * sizeof(float);
+
+    printf("Grid dim: %d, %d\n", grid_dim.x, grid_dim.y);
+    printf("Block dim: %d, %d\n", block_dim.x, block_dim.y);
+    printf("Shared memory size: %zu bytes\n", shm_bytes);
     mantener_fuentes_de_calor<<<1, 1>>>(d_grid, grid_size);
     cudaDeviceSynchronize();
+
     double ti_total = dwalltime();
-    for (int i = 0; i < steps; i++) {
-        update_simulation(d_grid, d_grid_new, grid_size, diffusion_rate, threads_per_block, grid_dim, block_dim);
+    // Iteraciones de simulación
+    for (int step = 0; step < steps; ++step) {
+        actualizar_simulacion<<<grid_dim, block_dim, shm_bytes>>>(d_grid, d_grid_new, N, diffusion_rate);
+        // Enforce sources on the freshly computed field
+        mantener_fuentes_de_calor<<<1, 1>>>(d_grid_new, grid_size);
+        // Now make the new field the current one
+        tmp = d_grid; d_grid = d_grid_new; d_grid_new = tmp;
     }
     double tf_total = dwalltime();
     printf("Time taken: %f seconds\n", tf_total - ti_total);
@@ -122,6 +139,7 @@ int main(int argc, char** argv){
     cudaMemcpy(h_grid, d_grid, grid_size * grid_size * sizeof(float), cudaMemcpyDeviceToHost);
     PRINT_ARRAY(h_grid, grid_size * grid_size);
 
+    // Guardar para visualizar
     FILE* fp = fopen(output_path, "w");
     if (!fp) {
         fprintf(stderr, "Error: could not open output file '%s' for writing.\n", output_path);
