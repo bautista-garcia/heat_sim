@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include "heat_simulation.h"
 
+
 float* new_grid;
 
 float diffusion_rate = 0.25f;
