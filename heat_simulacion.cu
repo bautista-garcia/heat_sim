@@ -7,22 +7,20 @@
 #define TILE_X 32
 #define PADDING_SM 1
 #define PADDING_GLOBAL 2
-#define HALO_SM 2
 
 
 // 2 grids para evitar conflictos de memoria en DEVICE y una en HOST para resultado final
 float *d_grid, *d_grid_new, *h_grid, *tmp; 
 float diffusion_rate = 0.25f;
-int grid_size, pitch_elems;       
+int grid_size;       
 
 
 __host__ void initialize_grid(int N) {
-    // Grilla NxN + padding global
-    grid_size = N;             
-    pitch_elems = N + PADDING_GLOBAL;         
-    h_grid = (float*)malloc(sizeof(float) * pitch_elems * pitch_elems);
+    grid_size = N;
+    // Grilla NxN + padding global          
+    h_grid = (float*)malloc(sizeof(float) * N * N);
 
-    size_t bytes = sizeof(float) * pitch_elems * pitch_elems;
+    size_t bytes = sizeof(float) * N * N;
     cudaMalloc(&d_grid, bytes);
     cudaMalloc(&d_grid_new, bytes);
 
@@ -31,50 +29,44 @@ __host__ void initialize_grid(int N) {
 }
 
 // TODO: Kernel de unico thread para evitar transferencia entre pasos
-__global__ void mantener_fuentes_de_calor(float* _grid, int grid_size, int pitch){
+__global__ void mantener_fuentes_de_calor(float* _grid, int grid_size){
     int cx = grid_size / 2;
     int cy = grid_size / 2;
-    // Account for padding: data starts at (pitch + 1)
-    int base_offset = pitch + 1;
     // Centro
-    _grid[base_offset + cy * pitch + cx] = 100.0f;
+    _grid[cy * grid_size + cx] = 100.0f;
     // Offsets
     int offset = 20;
-    if (cy + offset < grid_size && cx + offset < grid_size) _grid[base_offset + (cy + offset) * pitch + (cx + offset)] = 100.0f;
-    if (cy + offset < grid_size && cx >= offset) _grid[base_offset + (cy + offset) * pitch + (cx - offset)] = 100.0f;
-    if (cy >= offset && cx + offset < grid_size) _grid[base_offset + (cy - offset) * pitch + (cx + offset)] = 100.0f;
-    if (cy >= offset && cx >= offset) _grid[base_offset + (cy - offset) * pitch + (cx - offset)] = 100.0f;
+    if (cy + offset < grid_size && cx + offset < grid_size) _grid[(cy + offset) * grid_size + (cx + offset)] = 100.0f;
+    if (cy + offset < grid_size && cx >= offset) _grid[(cy + offset) * grid_size + (cx - offset)] = 100.0f;
+    if (cy >= offset && cx + offset < grid_size) _grid[(cy - offset) * grid_size + (cx + offset)] = 100.0f;
+    if (cy >= offset && cx >= offset) _grid[(cy - offset) * grid_size + (cx - offset)] = 100.0f;
 }
 
-__global__ void actualizar_simulacion(const float* __restrict__ _grid, float* __restrict__ _grid_new, int N, int pitch, float k) {
+__global__ void actualizar_simulacion(const float* __restrict__ _grid, float* __restrict__ _grid_new, int grid_size, float k) {
     int x  = blockIdx.x * blockDim.x + threadIdx.x;
     int y  = blockIdx.y * blockDim.y + threadIdx.y;
     // Bordes no se procesan
-    if (x >= N ||  y >= N) return; 
-    // Sumamos offset a punteros por padding en alocacion 
-    const float* g = _grid     + pitch + 1;
-    float*       o = _grid_new + pitch + 1;
+    if (x <= 0  ||  x >= grid_size-1  ||  y <= 0  ||  y >= grid_size-1) return; 
+
     // Memoria compartida
     extern __shared__ float smem[];
-    const int stride_y = blockDim.x + 3; // +2 halo + 1 padding
-    const int lx = threadIdx.x + 1;
-    const int ly = threadIdx.y + 1;
+    const int stride = blockDim.x + PADDING_SM; // +1 padding para evitar bank conflicts
+    const int lx = threadIdx.x;
+    const int ly = threadIdx.y;
     // Posicion del grid a procesar (flat index)
-    int i = y * pitch + x;
+    int i = y * grid_size + x;
     // Carga a memoria compartida
-    smem[ly * stride_y + lx] = g[i]; // Centro del bloque (coalescente)
-    if (threadIdx.y == 0) smem[lx] = g[i - pitch];                 // Halo superior (coalescente)
-    if (threadIdx.y == blockDim.y - 1) smem[(blockDim.y + 1) * stride_y + lx] = g[i + pitch]; // Halo inferior (coalescente)
-    if (threadIdx.x == 0) smem[ly * stride_y] = g[i - 1];         // Halo izquierdo (no coalescente)
-    if (threadIdx.x == blockDim.x - 1) smem[ly * stride_y + (blockDim.x + 1)] = g[i + 1];     // Halo derecho (no coalescente)
+    smem[ly * stride + lx] = _grid[i]; // Centro del bloque (coalescente)
     __syncthreads();
-    float c = smem[ly * stride_y + lx];
-    float u = smem[(ly-1) * stride_y + lx];
-    float d = smem[(ly+1) * stride_y + lx];
-    float l = smem[ly * stride_y + (lx-1)];
-    float r = smem[ly * stride_y + (lx+1)];
+
+    const int idx = ly * stride + lx;
+    float c = smem[idx];
+    float u = (threadIdx.y > 0 && y > 1) ? smem[(ly - 1) * stride + lx] : _grid[i - grid_size];
+    float d = (threadIdx.y < blockDim.y - 1 && y < grid_size - 2) ? smem[(ly + 1) * stride + lx] : _grid[i + grid_size];
+    float l = (threadIdx.x > 0 && x > 1) ? smem[ly * stride + (lx - 1)] : _grid[i - 1];
+    float r = (threadIdx.x < blockDim.x - 1 && x < grid_size - 2) ? smem[ly * stride + (lx + 1)] : _grid[i + 1];
     // Escritura a memoria global
-    o[i] = c + k * (u + d + l + r - 4.0f * c);
+    _grid_new[i] = c + k * (u + d + l + r - 4.0f * c);
 }
 
 __global__ void reduction_kernel(const float* __restrict__ input, float* __restrict__ output, int n) {
@@ -135,7 +127,7 @@ int main(int argc, char** argv){
     dim3 block_dim(TILE_X, CEIL_DIV(threads_per_block, TILE_X));
     dim3 grid_dim(CEIL_DIV(N, block_dim.x), CEIL_DIV(N, block_dim.y));
     // Memoria compartida = Tamaño de bloque + padding (evitar conflictos de bancos) + halo (bordes de bloque)
-    size_t shm_bytes = (size_t)(block_dim.y + HALO_SM) * (block_dim.x + HALO_SM + PADDING_SM) * sizeof(float);
+    size_t shm_bytes = (size_t)(block_dim.y) * (block_dim.x + PADDING_SM) * sizeof(float);
 
     // Config de reduccion
     int num_blocks_reduce = CEIL_DIV(N * N, threads_per_block * 2); // 2 because of the first reduction step
@@ -203,17 +195,17 @@ int main(int argc, char** argv){
 
     // Simulacion
     float result_reduce_prev = 0.0f, result_reduce_curr = 0.0f;
-    mantener_fuentes_de_calor<<<1, 1>>>(d_grid, grid_size, pitch_elems);
+    mantener_fuentes_de_calor<<<1, 1>>>(d_grid, grid_size);
     cudaDeviceSynchronize();
     double ti_total = dwalltime();
     for (int step = 0; step < steps; ++step) {
         // PASO DE SIMULACION
-        actualizar_simulacion<<<grid_dim, block_dim, shm_bytes>>>(d_grid, d_grid_new, N, pitch_elems, diffusion_rate);
-        mantener_fuentes_de_calor<<<1, 1>>>(d_grid_new, grid_size, pitch_elems);
+        actualizar_simulacion<<<grid_dim, block_dim, shm_bytes>>>(d_grid, d_grid_new, grid_size, diffusion_rate);
+        mantener_fuentes_de_calor<<<1, 1>>>(d_grid_new, grid_size);
         result_reduce_prev = result_reduce_curr;
         // PASO DE REDUCCION
         cudaMemset(d_result_reduce, 0, sizeof(float) * num_blocks_reduce);
-        reduction_kernel<<<num_blocks_reduce, threads_per_block, shm_bytes_reduce>>>(d_grid_new, d_result_reduce, N * N);
+        reduction_kernel<<<num_blocks_reduce, threads_per_block, shm_bytes_reduce>>>(d_grid_new, d_result_reduce, grid_size * grid_size);
         cudaDeviceSynchronize();
         cudaMemcpy(h_result_reduce, d_result_reduce, sizeof(float) * num_blocks_reduce, cudaMemcpyDeviceToHost);
         float result_reduce = 0.0f;
@@ -232,7 +224,7 @@ int main(int argc, char** argv){
     printf("Time taken: %f seconds\n", tf_total - ti_total);
 
     cudaDeviceSynchronize();
-    cudaMemcpy(h_grid, d_grid, pitch_elems * pitch_elems * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_grid, d_grid, grid_size * grid_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // --------------------------------------------------------------
     // VISUALIZACION CON PYTHON (EXTRA)
@@ -245,12 +237,10 @@ int main(int argc, char** argv){
         return 1;
     }
 
-    fprintf(fp, "%d\n", grid_size);
-    // Extract data region from padded grid: data starts at (pitch_elems + 1)
-    int base_offset = pitch_elems + 1;
+    fprintf(fp, "%d\n", grid_size);    // Plain grid, no pitch/padding
     for (int y = 0; y < grid_size; y++) {
         for (int x = 0; x < grid_size; x++) {
-            fprintf(fp, "%.6f", h_grid[base_offset + y * pitch_elems + x]);
+            fprintf(fp, "%.6f", h_grid[y * grid_size + x]);
             if (x < grid_size - 1) {
                 fputc(' ', fp);
             }
