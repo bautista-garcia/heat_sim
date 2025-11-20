@@ -57,17 +57,18 @@ __global__ void actualizar_simulacion(const float* __restrict__ _grid, float* __
     const int ly = threadIdx.y + 1;
 
     smem[ly * stride + lx] = _grid[i]; 
-    if (threadIdx.y == 0) && (y > 0) { // Top Halo
+    // Top Halo
+    if ((threadIdx.y == 0) && (y > 0)) { // Top Halo
         smem[0 * stride + lx] = _grid[i - grid_size];
     }
-    if (threadIdx.y == blockDim.y - 1) && (y < grid_size - 1) { // Bottom Halo
+    if ((threadIdx.y == blockDim.y - 1) && (y < grid_size - 1)) { // Bottom Halo
         smem[(blockDim.y + 1) * stride + lx] = _grid[i + grid_size];
     }
     
-    if (threadIdx.x == 0) && (x > 0) { // Left Halo
+    if ((threadIdx.x == 0) && (x > 0)) { // Left Halo
         smem[ly * stride + 0] = _grid[i - 1];
     }
-    if (threadIdx.x == blockDim.x - 1) && (x < grid_size - 1) { // Right Halo
+    if ((threadIdx.x == blockDim.x - 1) && (x < grid_size - 1)) { // Right Halo
         smem[ly * stride + (blockDim.x + 1)] = _grid[i + 1];
     }
     
