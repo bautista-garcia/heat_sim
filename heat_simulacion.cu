@@ -7,6 +7,7 @@
 #define TILE_X 32
 #define PADDING_SM 1
 #define PADDING_GLOBAL 2
+#define HALO_SM 2
 
 
 // 2 grids para evitar conflictos de memoria en DEVICE y una en HOST para resultado final
@@ -45,28 +46,47 @@ __global__ void mantener_fuentes_de_calor(float* _grid, int grid_size){
 __global__ void actualizar_simulacion(const float* __restrict__ _grid, float* __restrict__ _grid_new, int grid_size, float k) {
     int x  = blockIdx.x * blockDim.x + threadIdx.x;
     int y  = blockIdx.y * blockDim.y + threadIdx.y;
-    // Bordes no se procesan
-    if (x <= 0  ||  x >= grid_size-1  ||  y <= 0  ||  y >= grid_size-1) return; 
-
-    // Memoria compartida
-    extern __shared__ float smem[];
-    const int stride = blockDim.x + PADDING_SM; // +1 padding para evitar bank conflicts
-    const int lx = threadIdx.x;
-    const int ly = threadIdx.y;
-    // Posicion del grid a procesar (flat index)
     int i = y * grid_size + x;
-    // Carga a memoria compartida
-    smem[ly * stride + lx] = _grid[i]; // Centro del bloque (coalescente)
-    __syncthreads();
 
-    const int idx = ly * stride + lx;
-    float c = smem[idx];
-    float u = (threadIdx.y > 0 && y > 1) ? smem[(ly - 1) * stride + lx] : _grid[i - grid_size];
-    float d = (threadIdx.y < blockDim.y - 1 && y < grid_size - 2) ? smem[(ly + 1) * stride + lx] : _grid[i + grid_size];
-    float l = (threadIdx.x > 0 && x > 1) ? smem[ly * stride + (lx - 1)] : _grid[i - 1];
-    float r = (threadIdx.x < blockDim.x - 1 && x < grid_size - 2) ? smem[ly * stride + (lx + 1)] : _grid[i + 1];
-    // Escritura a memoria global
-    _grid_new[i] = c + k * (u + d + l + r - 4.0f * c);
+    if (x >= grid_size || y >= grid_size) return;
+
+    // Memoria compartida 
+    extern __shared__ float smem[];
+    const int stride = blockDim.x + HALO_SM;
+    const int lx = threadIdx.x + 1;
+    const int ly = threadIdx.y + 1;
+
+    smem[ly * stride + lx] = _grid[i]; 
+    if (threadIdx.y == 0) && (y > 0) { // Top Halo
+        smem[0 * stride + lx] = _grid[i - grid_size];
+    }
+    if (threadIdx.y == blockDim.y - 1) && (y < grid_size - 1) { // Bottom Halo
+        smem[(blockDim.y + 1) * stride + lx] = _grid[i + grid_size];
+    }
+    
+    if (threadIdx.x == 0) && (x > 0) { // Left Halo
+        smem[ly * stride + 0] = _grid[i - 1];
+    }
+    if (threadIdx.x == blockDim.x - 1) && (x < grid_size - 1) { // Right Halo
+        smem[ly * stride + (blockDim.x + 1)] = _grid[i + 1];
+    }
+    
+    __syncthreads();
+    
+    // No se procesan los bordes
+    if (x > 0 && x < grid_size - 1 && y > 0 && y < grid_size - 1) {
+        float c = smem[ly * stride + lx];
+        float u = smem[(ly - 1) * stride + lx];
+        float d = smem[(ly + 1) * stride + lx];
+        float l = smem[ly * stride + (lx - 1)];
+        float r = smem[ly * stride + (lx + 1)];
+        
+        _grid_new[i] = c + k * (u + d + l + r - 4.0f * c);
+    } else { // Para bordes copiamos valor anterior
+        if (x < grid_size && y < grid_size) {
+             _grid_new[i] = _grid[i];
+        }
+    }
 }
 
 __global__ void reduction_kernel(const float* __restrict__ input, float* __restrict__ output, int n) {
@@ -127,7 +147,7 @@ int main(int argc, char** argv){
     dim3 block_dim(TILE_X, CEIL_DIV(threads_per_block, TILE_X));
     dim3 grid_dim(CEIL_DIV(N, block_dim.x), CEIL_DIV(N, block_dim.y));
     // Memoria compartida = Tamaño de bloque + padding (evitar conflictos de bancos) + halo (bordes de bloque)
-    size_t shm_bytes = (size_t)(block_dim.y) * (block_dim.x + PADDING_SM) * sizeof(float);
+    size_t shm_bytes = (size_t)(block_dim.y + HALO_SM) * (block_dim.x + HALO_SM) * sizeof(float);
 
     // Config de reduccion
     int num_blocks_reduce = CEIL_DIV(N * N, threads_per_block * 2); // 2 because of the first reduction step
