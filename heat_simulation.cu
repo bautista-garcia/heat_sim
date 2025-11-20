@@ -166,7 +166,7 @@ __host__ bool update_simulation() {
 
     cudaMemcpy(&h_result_reduce, d_grid, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_grid, d_grid_new, grid_size * grid_size * sizeof(float), cudaMemcpyDeviceToHost);
-    if (fabs(h_result_reduce - h_result_reduce_prev) < 0.0001f) {
+    if (fabs(h_result_reduce - h_result_reduce_prev) * (grid_size * grid_size) < 0.001f) {
         converged = true;
     }
     h_result_reduce_prev = h_result_reduce;
