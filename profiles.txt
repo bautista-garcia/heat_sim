@@ -1,2 +1,4 @@
 Shared mem bank conflicts (on CLI):
 sudo ncu --section-folder /usr/lib/nsight-compute/sections --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum /home/bautistagpu/heat_sim/heat 64 128 0.25 1
+Profiling completo (para abrir con Nsight Compute)
+sudo ncu -f --section-folder /usr/lib/nsight-compute/sections --set full -o profile /home/bautistagpu/heat_sim/heat 64 128
