@@ -10,20 +10,29 @@
 
 
 // Parametros de simulacion
-int N = 64;
-int threads_per_block = 128;
+int N, threads_per_block;
 float diffusion_rate = 0.25f;
 int steps = 10000;
+float tolerance = 0.00001f;
 const char* output_path = "simulation_output.txt";
 
 
 float *d_grid, *d_grid_new, *h_grid, *tmp; 
 int grid_size;       
 
+#ifdef PROFILE
+double start_total, end_total;
+double total_time_diffusion = 0.0, total_time_mantener = 0.0, total_time_reduce = 0.0;
+double total_time_copy_d2d = 0.0, total_time_copy_d2h = 0.0;
+double start_diffusion, end_diffusion, start_mantener, end_mantener, start_reduce, end_reduce;
+double start_copy_d2d, end_copy_d2d, start_copy_d2h, end_copy_d2h;
+int num_steps_executed = 0;
+#endif
+
 // Configuracion de difusion
-dim3 block_diffusion(TILE_X, CEIL_DIV(threads_per_block, TILE_X));
-dim3 grid_diffusion(CEIL_DIV(N, block_diffusion.x), CEIL_DIV(N, block_diffusion.y));
-size_t shm_bytes_diffusion = (size_t)(block_diffusion.y + HALO_SM) * (block_diffusion.x + HALO_SM) * sizeof(float);
+dim3 block_diffusion;
+dim3 grid_diffusion;
+size_t shm_bytes_diffusion;
 
 // Configuracion de mantener de fuentes de calor
 dim3 block_mantener(1, 1);
@@ -31,11 +40,21 @@ dim3 grid_mantener(1, 1);
 size_t shm_bytes_mantener = 0;
 
 // Configuracion inicial de reduccion
-dim3 block_reduce(threads_per_block, 1);
-dim3 grid_reduce(CEIL_DIV(N * N, threads_per_block * 2), 1);
-size_t shm_bytes_reduce = threads_per_block * sizeof(float);
+dim3 block_reduce;
+dim3 grid_reduce;
+size_t shm_bytes_reduce;
 int len_reduce = grid_size * grid_size;
 float h_result_reduce, h_result_reduce_prev;
+
+double dwalltime(){
+    double sec;
+    struct timeval tv;
+
+    gettimeofday(&tv,NULL);
+    sec = tv.tv_sec + tv.tv_usec/1000000.0;
+    return sec;
+}
+
 
 
 __global__ void mantener_fuentes_de_calor(float* _grid, int grid_size){
@@ -121,6 +140,15 @@ __host__ void initialize_grid(int N) {
     h_result_reduce = 0.0f;
     h_result_reduce_prev = -1.0f;
 
+    // Recalcular configuraciones de kernels con los valores correctos
+    block_diffusion = dim3(TILE_X, CEIL_DIV(threads_per_block, TILE_X));
+    grid_diffusion = dim3(CEIL_DIV(N, block_diffusion.x), CEIL_DIV(N, block_diffusion.y));
+    shm_bytes_diffusion = (size_t)(block_diffusion.y + HALO_SM) * (block_diffusion.x + HALO_SM) * sizeof(float);
+    
+    block_reduce = dim3(threads_per_block, 1);
+    grid_reduce = dim3(CEIL_DIV(N * N, threads_per_block * 2), 1);
+    shm_bytes_reduce = threads_per_block * sizeof(float);
+
     size_t bytes = sizeof(float) * N * N;
     cudaMalloc(&d_grid, bytes);
     cudaMalloc(&d_grid_new, bytes);
@@ -145,28 +173,71 @@ __host__ void destroy__grid(){
 __host__ bool update_simulation() {
     bool converged = false;
     // Paso de difusion
+    #ifdef PROFILE
+    start_diffusion = dwalltime();
+    #endif
     difusion_kernel<<<grid_diffusion, block_diffusion, shm_bytes_diffusion>>>(d_grid, d_grid_new, grid_size, diffusion_rate);
+    #ifdef PROFILE
     cudaDeviceSynchronize();
+    end_diffusion = dwalltime();
+    total_time_diffusion += (end_diffusion - start_diffusion);
+    #endif
     // Recuperamos fuentes de calor
+    #ifdef PROFILE
+    start_mantener = dwalltime();
+    #endif
     mantener_fuentes_de_calor<<<1, 1>>>(d_grid_new, grid_size);
+    #ifdef PROFILE
+    cudaDeviceSynchronize();
+    end_mantener = dwalltime();
+    total_time_mantener += (end_mantener - start_mantener);
+    #endif
 
     // Reduccion (iterativa en device) + chequeo de convergencia en host
+    #ifdef PROFILE
+    start_copy_d2d = dwalltime();
+    #endif
     cudaMemcpy(d_grid, d_grid_new, grid_size * grid_size * sizeof(float), cudaMemcpyDeviceToDevice);
-    grid_reduce.x = CEIL_DIV(N * N, threads_per_block * 2);
+    #ifdef PROFILE
+    end_copy_d2d = dwalltime();
+    total_time_copy_d2d += (end_copy_d2d - start_copy_d2d);
+    #endif
+    grid_reduce.x = CEIL_DIV(grid_size * grid_size, threads_per_block * 2);
     int len_reduce = grid_size * grid_size;
     
     while (grid_reduce.x > 1) {
+        #ifdef PROFILE
+        start_reduce = dwalltime();
+        #endif
         reduction_kernel<<<grid_reduce, block_reduce, shm_bytes_reduce>>>(d_grid, d_grid, len_reduce);
+        #ifdef PROFILE
         cudaDeviceSynchronize();
+        end_reduce = dwalltime();
+        total_time_reduce += (end_reduce - start_reduce);
+        #endif
         len_reduce = grid_reduce.x;
         grid_reduce.x = CEIL_DIV(len_reduce, threads_per_block * 2);
     }
+    #ifdef PROFILE
+    start_reduce = dwalltime();
+    #endif
     reduction_kernel<<<grid_reduce, block_reduce, shm_bytes_reduce>>>(d_grid, d_grid, len_reduce);
+    #ifdef PROFILE
     cudaDeviceSynchronize();
+    end_reduce = dwalltime();
+    total_time_reduce += (end_reduce - start_reduce);
+    #endif
 
+    #ifdef PROFILE
+    start_copy_d2h = dwalltime();
+    #endif
     cudaMemcpy(&h_result_reduce, d_grid, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_grid, d_grid_new, grid_size * grid_size * sizeof(float), cudaMemcpyDeviceToHost);
-    if (fabs(h_result_reduce - h_result_reduce_prev) * (grid_size * grid_size) < 0.001f) {
+    #ifdef PROFILE
+    end_copy_d2h = dwalltime();
+    total_time_copy_d2h += (end_copy_d2h - start_copy_d2h);
+    #endif
+    if ((fabs(h_result_reduce - h_result_reduce_prev) / (grid_size * grid_size)) < tolerance) {
         converged = true;
     }
     h_result_reduce_prev = h_result_reduce;
@@ -180,14 +251,6 @@ __host__ bool update_simulation() {
 }
 
 
-double dwalltime(){
-    double sec;
-    struct timeval tv;
-
-    gettimeofday(&tv,NULL);
-    sec = tv.tv_sec + tv.tv_usec/1000000.0;
-    return sec;
-}
 
 int main(int argc, char** argv){
     // Device properties
@@ -196,7 +259,7 @@ int main(int argc, char** argv){
     PRINT_DEVICE_SUMMARY(prop);
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <grid_size> <threads_per_block> <diffusion_rate> <steps> [output_path]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <N> <threads_per_block>\n", argv[0]);
         return 1;
     }
 
@@ -204,19 +267,29 @@ int main(int argc, char** argv){
     N = atoi(argv[1]); // Tamaño de la grilla
     threads_per_block = atoi(argv[2]);
 
+    start_total = dwalltime();
     initialize_grid(N);
     bool converged = false;
+    num_steps_executed = 0;
     for (int step = 0; step < steps; ++step) {
         converged = update_simulation();
+        num_steps_executed++;
         if (converged) {
-            printf("Simulation converged at step %d\n", step);
             break;
         }
     }
 
     cudaDeviceSynchronize();
+    #ifdef PROFILE
+    start_copy_d2h = dwalltime();
+    #endif
     cudaMemcpy(h_grid, d_grid, grid_size * grid_size * sizeof(float), cudaMemcpyDeviceToHost);
+    #ifdef PROFILE
+    end_copy_d2h = dwalltime();
+    total_time_copy_d2h += (end_copy_d2h - start_copy_d2h);
+    #endif
 
+    end_total = dwalltime();
     // --------------------------------------------------------------
     // VISUALIZACION CON PYTHON 
     FILE* fp = fopen(output_path, "w");
@@ -241,6 +314,21 @@ int main(int argc, char** argv){
     fclose(fp);
     printf("Saved simulation snapshot to %s\n", output_path);
     // --------------------------------------------------------------
+
+    #ifdef PROFILE
+    printf("\n=== RESULTADOS DE PROFILING ===\n");
+    printf("Configuracion: N = %d, threads_per_block = %d, epsilon = %f\n", N, threads_per_block, tolerance);
+    printf("Tiempo total de ejecución: %.6f segundos\n", end_total - start_total);
+    printf("Pasos ejecutados: %d\n", num_steps_executed);
+    if (num_steps_executed > 0) {
+        printf("Tiempo promedio por paso en kernel de difusión: %.8f segundos\n", total_time_diffusion / num_steps_executed);
+        printf("Tiempo promedio por paso en kernel mantener fuentes: %.8f segundos\n", total_time_mantener / num_steps_executed);
+        printf("Tiempo promedio por paso en kernel de reducción: %.8f segundos\n", total_time_reduce / num_steps_executed);
+        printf("Tiempo promedio por paso en copias Device-to-Device: %.8f segundos\n", total_time_copy_d2d / num_steps_executed);
+        printf("Tiempo promedio por paso en copias Device-to-Host: %.8f segundos\n", total_time_copy_d2h / num_steps_executed);
+    }
+    printf("================================\n");
+    #endif
 
     destroy__grid();
     return 0;
