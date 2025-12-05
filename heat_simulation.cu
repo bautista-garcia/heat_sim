@@ -177,8 +177,8 @@ __host__ bool update_simulation() {
     start_diffusion = dwalltime();
     #endif
     difusion_kernel<<<grid_diffusion, block_diffusion, shm_bytes_diffusion>>>(d_grid, d_grid_new, grid_size, diffusion_rate);
-    #ifdef PROFILE
     cudaDeviceSynchronize();
+    #ifdef PROFILE
     end_diffusion = dwalltime();
     total_time_diffusion += (end_diffusion - start_diffusion);
     #endif
@@ -187,8 +187,8 @@ __host__ bool update_simulation() {
     start_mantener = dwalltime();
     #endif
     mantener_fuentes_de_calor<<<1, 1>>>(d_grid_new, grid_size);
-    #ifdef PROFILE
     cudaDeviceSynchronize();
+    #ifdef PROFILE
     end_mantener = dwalltime();
     total_time_mantener += (end_mantener - start_mantener);
     #endif
@@ -210,8 +210,8 @@ __host__ bool update_simulation() {
         start_reduce = dwalltime();
         #endif
         reduction_kernel<<<grid_reduce, block_reduce, shm_bytes_reduce>>>(d_grid, d_grid, len_reduce);
-        #ifdef PROFILE
         cudaDeviceSynchronize();
+        #ifdef PROFILE
         end_reduce = dwalltime();
         total_time_reduce += (end_reduce - start_reduce);
         #endif
@@ -222,8 +222,8 @@ __host__ bool update_simulation() {
     start_reduce = dwalltime();
     #endif
     reduction_kernel<<<grid_reduce, block_reduce, shm_bytes_reduce>>>(d_grid, d_grid, len_reduce);
-    #ifdef PROFILE
     cudaDeviceSynchronize();
+    #ifdef PROFILE
     end_reduce = dwalltime();
     total_time_reduce += (end_reduce - start_reduce);
     #endif
